@@ -1,5 +1,6 @@
 """时序质量领域服务：维护时序完整率、重复点与越界点的质量校验报告与结论。
-对时序数据执行质量检测校验并生成质量分数报告数据文件。"""
+对时序数据执行质量检测校验并生成质量分数报告数据文件。
+质量复验以单位标定批次台账为准，核对批量标定中各测点实际采用的换算规则版本。"""
 from __future__ import annotations
 
 import time
@@ -113,3 +114,49 @@ class SeriesQualityService(BaseModuleService):
         )
         return {"total_checked": len(results), "qualified": qualified,
                 "qualification_rate": round(qualified / max(len(results), 1), 2)}
+
+    def recheck_calibrate_batch(self, point_keys: list[str]) -> dict[str, Any]:
+        """质量复验：核对一次批量标定中各测点实际采用的换算规则版本。
+
+        以标定批次台账落账的规则快照为准，只读比对标定结果文件中的实际采样，
+        不重算也不覆盖已完成的换算；复验期间到达的规则更正不会替代已落账版本，
+        未处理测点的规则出处随台账快照一并返回。
+        """
+        cal_svc = self._safe_import("app.services.unit_calibrate", "UnitCalibrateService")()
+        recon = cal_svc.reconcile_batch(point_keys)
+        checks = []
+        for pk in point_keys:
+            ledger_rules = recon["rules"].get(pk, [])
+            used_versions = [r.get("rule_version") for r in ledger_rules]
+            # 读取交给时序质量的实际采样：标定结果文件原样比对，不回写
+            cal_file = self._data_dir("calibrated") / f"{pk}_calibrated.jsonl"
+            records = self._read_jsonl(cal_file)
+            file_versions = sorted({str(r.get("rule_version", "")) for r in records})
+            produced = pk in recon["produced"]
+            check: dict[str, Any] = {
+                "point": pk,
+                "produced": produced,
+                "used_rule_versions": used_versions,
+                "file_rule_versions": file_versions,
+                "records": len(records),
+                "calibrated_values": [r.get("calibrated_value_V") for r in records],
+            }
+            if produced:
+                consistent = bool(records) and set(used_versions).issubset(set(file_versions))
+                check["status"] = "一致" if consistent else "不一致"
+                check["consistent"] = consistent
+            else:
+                reason = next((u["reason"] for u in recon["unproduced"] if u["point"] == pk),
+                              "未产出")
+                check["status"] = "未产出"
+                check["reason"] = reason
+                check["consistent"] = None
+            checks.append(check)
+        produced_checks = [c for c in checks if c["produced"]]
+        return {
+            "batch_key": recon["batch_key"],
+            "reconciled": recon["reconciled"],
+            "points_checked": len(checks),
+            "consistent": all(c["consistent"] for c in produced_checks),
+            "checks": checks,
+        }
